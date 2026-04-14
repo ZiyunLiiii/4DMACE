@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local environment files
+.DS_Store
+
+# Large outputs and local data
+data/
+outputs/
+artifacts/
+*.npy
+*.npz
+*.tar
+*.tgz
+*.gz
+
+# IDE
+.idea/
+.vscode/
