@@ -16,8 +16,17 @@ Per-thread denoiser caching avoids cross-thread JAX state sharing.
 
 from __future__ import annotations
 
-import concurrent.futures
 import os
+import sys
+
+# Ensure JAX does not inherit incompatible system CUDA/cuDNN from LD_LIBRARY_PATH.
+if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env["_JAX_CLEAN_REEXEC"] = "1"
+    os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
+
+import concurrent.futures
 import threading
 import time
 
@@ -319,7 +328,7 @@ def mace4d_from_cone_beam_params(
 
 if __name__ == "__main__":
 
-    output_path = "/home/li5273/Desktop/data/output/2026/0402/4DMACE_multi_gpu"
+    output_path = "/home/li5273/Desktop/data/output/2026/0423/4DMACE_multi_gpu"
     os.makedirs(output_path, exist_ok=True)
 
     USE_SAVED_INIT_IMAGE = True
@@ -369,9 +378,8 @@ if __name__ == "__main__":
         optional_params_list.append(opt_t)
 
     if USE_SAVED_INIT_IMAGE:
-        init_image_path = (
-            "/home/li5273/Desktop/data/output/2026/0402/4DMACE/init/init_image.npy"
-        )
+        init_image_path = "/home/li5273/Desktop/data/output/2026/0423/4DMACE_multi_gpu/init//init_image.npy"
+
         init_image = np.load(init_image_path)
     else:
         init_image = None
