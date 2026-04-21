@@ -111,10 +111,10 @@ def denoiser_wrapper(x, permute_vector, sigma_list, device):
 
 
 # ---------------------------------------------------------------------------
-# Multi-GPU MACE core
+# Multi-threads MACE
 # ---------------------------------------------------------------------------
 
-def run_mace_with_models_multigpu(
+def run_mace_with_models_multi_threads(
     models,
     sino_list,
     weights_list,
@@ -133,14 +133,15 @@ def run_mace_with_models_multigpu(
     # ── GPU device discovery ───────────────────────────────────────────────
     devices = jax.devices("gpu")
     n_gpu = len(devices)
-    if n_gpu == 0:
-        raise RuntimeError("No GPU devices found by JAX.")
-    if n_gpu < 4:
-        raise RuntimeError(f"Need at least 4 GPUs, found {n_gpu}.")
-    gpu0, gpu1, gpu2, gpu3 = devices[0], devices[1], devices[2], devices[3]
+
+    device0, device1, device2, device3 = devices[0], devices[0], devices[0], devices[0]
+
+    # Switch to the following settings if you have 4 GPUs
+    # device0, device1, device2, device3 = devices[0], devices[1], devices[2], devices[3]
+
     if verbose:
         print(f"[MACE] Found {n_gpu} GPU(s): {devices}")
-        print(f"[MACE] GPU assignment: Agent0->GPU0, Agent1->GPU1, Agent2->GPU2, Agent3->GPU3")
+        print(f"[MACE] GPU assignment: Agent0->{device0}, Agent1->{device1}, Agent2->{device2}, Agent3->{device3}")
         print(f"[MACE] Start 4D reconstruction with {nt} time bins.")
 
     # ── Initialisation — serial on GPU 0, identical to original ───────────
@@ -151,8 +152,8 @@ def run_mace_with_models_multigpu(
         init_image = np.stack([
             np.asarray(
                 models[t].recon(
-                    jax.device_put(jnp.asarray(sino_list[t]), gpu0),
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
+                    jax.device_put(jnp.asarray(sino_list[t]), device0),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), device0),
                     max_iterations=20,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
@@ -192,11 +193,11 @@ def run_mace_with_models_multigpu(
         return np.stack([
             np.asarray(
                 models[t].prox_map(
-                    prox_input=jax.device_put(jnp.asarray(W_k[t]), gpu0),
-                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), gpu0),
+                    prox_input=jax.device_put(jnp.asarray(W_k[t]), device0),
+                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), device0),
                     sigma_prox=sigma_p,
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
-                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), gpu0),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), device0),
+                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), device0),
                     max_iterations=forward_num_iterations,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
@@ -205,16 +206,16 @@ def run_mace_with_models_multigpu(
         ])
 
     def run_prior_agent_1(W_k):
-        """Agent 1: qGGMRF XY-t (fixed z slabs), GPU 1."""
-        return denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=gpu1)
+        """Agent 1: qGGMRF XY-t (fixed z slabs), device 1."""
+        return denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=device1)
 
     def run_prior_agent_2(W_k):
-        """Agent 2: qGGMRF YZ-t (fixed row slabs), GPU 2."""
-        return denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=gpu2)
+        """Agent 2: qGGMRF YZ-t (fixed row slabs), device 2."""
+        return denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=device2)
 
     def run_prior_agent_3(W_k):
-        """Agent 3: qGGMRF XZ-t (fixed col slabs), GPU 3."""
-        return denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=gpu3)
+        """Agent 3: qGGMRF XZ-t (fixed col slabs), device 3."""
+        return denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=device3)
 
     # ── Main loop ─────────────────────────────────────────────────────
     for itr in range(max_admm_itr):
@@ -226,10 +227,10 @@ def run_mace_with_models_multigpu(
         W_snap = [np.copy(W[k]) for k in range(4)]
 
         # All 4 agents run concurrently:
-        #   Agent 0  -> GPU 0 (serial over time bins, same as original)
-        #   Agent 1  -> GPU 1  (qGGMRF XY-t)
-        #   Agent 2  -> GPU 2  (qGGMRF YZ-t)
-        #   Agent 3  -> GPU 3  (qGGMRF XZ-t)
+        #   Agent 0  -> Device 0 (serial over time bins)
+        #   Agent 1  -> Device 1 (qGGMRF XY-t)
+        #   Agent 2  -> Device 2 (qGGMRF YZ-t)
+        #   Agent 3  -> Device 3 (qGGMRF XZ-t)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             fut0 = pool.submit(run_forward_agent, W_snap[0], X[0])
             fut1 = pool.submit(run_prior_agent_1, W_snap[1])
@@ -299,7 +300,7 @@ def mace4d_from_cone_beam_params(
     if verbose:
         print(f"[MACE] Built {len(models)} cone-beam models.")
 
-    recon_4d = run_mace_with_models_multigpu(
+    recon_4d = run_mace_with_models_multi_threads(
         models=models,
         sino_list=sino_list,
         weights_list=weights_list,
