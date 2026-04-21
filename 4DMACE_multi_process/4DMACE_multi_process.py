@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import multiprocessing as mp
-
+import mbirjax as mj
 import numpy as np
 import mbirjax.preprocess as mjp
 from utilities_4D_multi_process import mace4d_from_cone_beam_params_multigpu
@@ -23,7 +23,7 @@ if __name__ == "__main__":
 
     dataset_url = "/depot/bouman/data/Lilly/4DCT/Phantom_30s_Run1_Dec2024.tgz"
     download_dir = "/home/li5273/PycharmProjects/lilly_exp/nsi/demo_data/"
-    dataset_dir = mjp.download_and_extract(dataset_url, download_dir)
+    dataset_dir = mj.download_and_extract(dataset_url, download_dir)
 
     # Preprocessing parameters
     downsample_rate = [1, 1]
