@@ -1,11 +1,18 @@
 from __future__ import annotations
-
 import os
 import time
+import sys
+
+# Ensure JAX does not inherit incompatible system CUDA/cuDNN from LD_LIBRARY_PATH.
+if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env["_JAX_CLEAN_REEXEC"] = "1"
+    os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
 import multiprocessing as mp
-import mbirjax as mj
 import numpy as np
 import mbirjax.preprocess as mjp
+import mbirjax as mj
 from utilities_4D_multi_process import mace4d_from_cone_beam_params_multigpu
 
 
