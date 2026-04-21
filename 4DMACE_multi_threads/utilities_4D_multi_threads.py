@@ -33,7 +33,6 @@ import time
 import jax
 import jax.numpy as jnp
 import mbirjax as mj
-import mbirjax.preprocess as mjp
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -217,7 +216,7 @@ def run_mace_with_models_multigpu(
         """Agent 3: qGGMRF XZ-t (fixed col slabs), GPU 3."""
         return denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=gpu3)
 
-    # ── Main ADMM loop ─────────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────────
     for itr in range(max_admm_itr):
         itr_t0 = time.time()
         if verbose:
@@ -265,11 +264,6 @@ def run_mace_with_models_multigpu(
         print("\n[MACE] Reconstruction complete.")
 
     return sum(beta[k] * X[k] for k in range(4))
-
-
-# ---------------------------------------------------------------------------
-# Public API — drop-in replacement for the original mace4d_from_cone_beam_params
-# ---------------------------------------------------------------------------
 
 def mace4d_from_cone_beam_params(
     sino_list,
