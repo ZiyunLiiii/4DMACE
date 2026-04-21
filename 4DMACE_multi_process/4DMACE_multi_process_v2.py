@@ -11,9 +11,29 @@ if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
     env["_JAX_CLEAN_REEXEC"] = "1"
     os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
 import multiprocessing as mp
+from multiprocessing import shared_memory
 import numpy as np
-# import mbirjax.preprocess as mjp
-# import mbirjax as mj
+
+
+# -----------------------------------------------------------------------------
+# Shared-memory helpers
+# -----------------------------------------------------------------------------
+
+def create_shared_numpy(shape, dtype=np.float32, name=None):
+    """Create a shared-memory NumPy array and return (shm, array_view)."""
+    dtype = np.dtype(dtype)
+    nbytes = int(np.prod(shape)) * dtype.itemsize
+    shm = shared_memory.SharedMemory(create=True, size=nbytes, name=name)
+    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    return shm, arr
+
+
+def attach_shared_numpy(name, shape, dtype=np.float32):
+    """Attach to an existing shared-memory NumPy array and return (shm, array_view)."""
+    dtype = np.dtype(dtype)
+    shm = shared_memory.SharedMemory(name=name)
+    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    return shm, arr
 
 
 # -----------------------------------------------------------------------------
@@ -31,7 +51,6 @@ def normalize_prior_weights(prior_weight):
 
 # -----------------------------------------------------------------------------
 # Worker-side helpers
-# These functions are imported/executed inside subprocesses after GPU binding.
 # -----------------------------------------------------------------------------
 
 def get_qggmrf_denoiser_process_local(shape, denoiser_cache, mj_module):
@@ -89,8 +108,21 @@ def denoiser_wrapper_worker(x, permute_vector, sigma_list, denoiser_cache, mj_mo
 # Forward agent subprocess
 # -----------------------------------------------------------------------------
 
-def forward_agent_worker(physical_gpu_id: int, task_queue, result_queue,
-                         weight_type, cone_beam_params_list, optional_params_list, sino_list, sharpness, verbose):
+def forward_agent_worker(
+    physical_gpu_id,
+    task_queue,
+    result_queue,
+    weight_type,
+    cone_beam_params_list,
+    optional_params_list,
+    sino_list,
+    sharpness,
+    verbose,
+    shared_W0_name,
+    shared_X0_name,
+    shared_shape,
+    shared_dtype_str,
+):
     """
     Persistent forward-agent subprocess.
 
@@ -99,6 +131,10 @@ def forward_agent_worker(physical_gpu_id: int, task_queue, result_queue,
       2) imports JAX/MBIRJAX after binding,
       3) builds all cone-beam models locally,
       4) repeatedly executes the forward prox_map agent.
+
+    The forward agent reads W[0] and X[0] from shared memory and writes its
+    output X[0] back to shared memory, so that large 4D arrays are not sent
+    through multiprocessing.Queue every iteration.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -112,7 +148,11 @@ def forward_agent_worker(physical_gpu_id: int, task_queue, result_queue,
         raise RuntimeError(f"[Forward worker] No visible GPU for physical GPU {physical_gpu_id}.")
     device = visible_gpus[0]
 
-    # Build weights and models inside this subprocess.
+    shared_dtype = np.dtype(shared_dtype_str)
+    shm_W0, W0_shared = attach_shared_numpy(shared_W0_name, shared_shape, shared_dtype)
+    shm_X0, X0_shared = attach_shared_numpy(shared_X0_name, shared_shape, shared_dtype)
+
+    # Keep weights on CPU as NumPy arrays. Transfer only the current bin to GPU.
     weights_list = [np.asarray(mj.gen_weights(np.asarray(s), weight_type=weight_type)) for s in sino_list]
 
     models = []
@@ -125,69 +165,86 @@ def forward_agent_worker(physical_gpu_id: int, task_queue, result_queue,
     nt = len(sino_list)
 
     if verbose:
-        print(f"[Forward worker PID {os.getpid()}] Bound to physical GPU {physical_gpu_id}, visible device {device}")
+        print(
+            f"[Forward worker PID {os.getpid()}] Bound to physical GPU {physical_gpu_id}, "
+            f"visible device {device}",
+            flush=True,
+        )
 
-    while True:
-        task = task_queue.get()
+    try:
+        while True:
+            task = task_queue.get()
 
-        if task["cmd"] == "stop":
-            if verbose:
-                print(f"[Forward worker PID {os.getpid()}] Stopping.")
-            break
+            if task["cmd"] == "stop":
+                if verbose:
+                    print(f"[Forward worker PID {os.getpid()}] Stopping.", flush=True)
+                break
 
-        if task["cmd"] == "recon_init":
-            stop_threshold = task["stop_threshold"]
+            if task["cmd"] == "recon_init":
+                stop_threshold = task["stop_threshold"]
 
-            init_image = np.asarray([
-                np.asarray(
-                    models[t].recon(
-                        jax.device_put(jnp.asarray(sino_list[t]), device),
-                        weights=jax.device_put(jnp.asarray(weights_list[t]), device),
-                        max_iterations=20,
-                        stop_threshold_change_pct=stop_threshold,
-                    )[0]
-                )
-                for t in range(nt)
-            ])
+                init_image = np.asarray([
+                    np.asarray(
+                        models[t].recon(
+                            jax.device_put(jnp.asarray(sino_list[t]), device),
+                            weights=jax.device_put(jnp.asarray(weights_list[t]), device),
+                            max_iterations=20,
+                            stop_threshold_change_pct=stop_threshold,
+                        )[0]
+                    )
+                    for t in range(nt)
+                ])
 
-            result_queue.put({
-                "agent_id": 0,
-                "cmd": "recon_init_done",
-                "init_image": init_image,
-            })
+                # Also store the initialization in shared X0 so the first iteration
+                # can reuse it without extra queue transfer.
+                X0_shared[...] = init_image
 
-        elif task["cmd"] == "forward_step":
-            W0 = task["W"]
-            X0_prev = task["X_prev"]
-            sigma_p = task["sigma_p"]
-            forward_num_iterations = task["forward_num_iterations"]
-            stop_threshold = task["stop_threshold"]
-            itr = task["itr"]
+                result_queue.put({
+                    "agent_id": 0,
+                    "cmd": "recon_init_done",
+                    "init_image": init_image,
+                })
 
-            X0 = np.asarray([
-                np.asarray(
-                    models[t].prox_map(
-                        prox_input=jax.device_put(jnp.asarray(W0[t]), device),
-                        sinogram=jax.device_put(jnp.asarray(sino_list[t]), device),
-                        sigma_prox=sigma_p,
-                        weights=jax.device_put(jnp.asarray(weights_list[t]), device),
-                        init_recon=jax.device_put(jnp.asarray(X0_prev[t]), device),
-                        max_iterations=forward_num_iterations,
-                        stop_threshold_change_pct=stop_threshold,
-                    )[0]
-                )
-                for t in range(nt)
-            ])
+            elif task["cmd"] == "forward_step":
+                sigma_p = task["sigma_p"]
+                forward_num_iterations = task["forward_num_iterations"]
+                stop_threshold = task["stop_threshold"]
+                itr = task["itr"]
 
-            result_queue.put({
-                "agent_id": 0,
-                "cmd": "forward_step_done",
-                "itr": itr,
-                "X": X0,
-            })
+                # Read the latest W[0] and X[0] directly from shared memory.
+                W0 = np.asarray(W0_shared)
+                X0_prev = np.asarray(X0_shared)
 
-        else:
-            raise ValueError(f"[Forward worker] Unknown command: {task['cmd']}")
+                X0 = np.asarray([
+                    np.asarray(
+                        models[t].prox_map(
+                            prox_input=jax.device_put(jnp.asarray(W0[t]), device),
+                            sinogram=jax.device_put(jnp.asarray(sino_list[t]), device),
+                            sigma_prox=sigma_p,
+                            weights=jax.device_put(jnp.asarray(weights_list[t]), device),
+                            init_recon=jax.device_put(jnp.asarray(X0_prev[t]), device),
+                            max_iterations=forward_num_iterations,
+                            stop_threshold_change_pct=stop_threshold,
+                        )[0]
+                    )
+                    for t in range(nt)
+                ])
+
+                # Write the result back to shared memory.
+                X0_shared[...] = X0
+
+                # Send only a small completion message.
+                result_queue.put({
+                    "agent_id": 0,
+                    "cmd": "forward_step_done",
+                    "itr": itr,
+                })
+
+            else:
+                raise ValueError(f"[Forward worker] Unknown command: {task['cmd']}")
+    finally:
+        shm_W0.close()
+        shm_X0.close()
 
 
 # -----------------------------------------------------------------------------
@@ -218,7 +275,8 @@ def prior_agent_worker(agent_id, physical_gpu_id, task_queue, result_queue,
     if verbose:
         print(
             f"[Prior worker {agent_id} PID {os.getpid()}] "
-            f"Bound to physical GPU {physical_gpu_id}, visible device {device}"
+            f"Bound to physical GPU {physical_gpu_id}, visible device {device}",
+            flush=True,
         )
 
     while True:
@@ -226,7 +284,7 @@ def prior_agent_worker(agent_id, physical_gpu_id, task_queue, result_queue,
 
         if task["cmd"] == "stop":
             if verbose:
-                print(f"[Prior worker {agent_id} PID {os.getpid()}] Stopping.")
+                print(f"[Prior worker {agent_id} PID {os.getpid()}] Stopping.", flush=True)
             break
 
         if task["cmd"] == "prior_step":
@@ -294,13 +352,26 @@ def run_mace_multigpu(
             f"forward->{gpu_ids[0]}, XY-t->{gpu_ids[1]}, YZ-t->{gpu_ids[2]}, XZ-t->{gpu_ids[3]}"
         )
 
+    forward_task_queue = mp.Queue()
+    result_queue = mp.Queue()
+
     # -------------------------------------------------------------------------
     # Step 1: obtain or compute initialization
     # -------------------------------------------------------------------------
-    # The initialization is produced by the forward worker so that the expensive
-    # reconstruction runs directly on its assigned GPU.
-    forward_task_queue = mp.Queue()
-    result_queue = mp.Queue()
+    if init_image is None:
+        init_shape = (nt,) + tuple(cone_beam_params_list[0]["recon_shape"])
+        init_dtype = np.float32
+    else:
+        init_image = np.asarray(init_image)
+        init_shape = init_image.shape
+        init_dtype = init_image.dtype
+
+    shm_W0, W0_shared = create_shared_numpy(init_shape, init_dtype)
+    shm_X0, X0_shared = create_shared_numpy(init_shape, init_dtype)
+
+    if init_image is not None:
+        W0_shared[...] = init_image
+        X0_shared[...] = init_image
 
     forward_proc = mp.Process(
         target=forward_agent_worker,
@@ -314,6 +385,10 @@ def run_mace_multigpu(
             sino_list,
             sharpness,
             verbose,
+            shm_W0.name,
+            shm_X0.name,
+            init_shape,
+            np.dtype(init_dtype).str,
         ),
     )
     forward_proc.start()
@@ -333,6 +408,8 @@ def run_mace_multigpu(
             raise RuntimeError("Initialization failed: unexpected message from forward worker.")
 
         init_image = np.asarray(msg["init_image"])
+        W0_shared[...] = init_image
+        X0_shared[...] = init_image
 
         if init_save_dir is not None:
             os.makedirs(init_save_dir, exist_ok=True)
@@ -348,9 +425,6 @@ def run_mace_multigpu(
     # -------------------------------------------------------------------------
     # Step 2: precompute sigma lists in the main process
     # -------------------------------------------------------------------------
-    # This is done once from the initialization. We use MBIRJAX here on CPU/main
-    # only for sigma estimation. If you prefer, these could also be computed in
-    # separate subprocesses, but doing it once here is simpler.
     if verbose:
         print("[MACE] Precomputing sigma lists for each denoising direction...")
 
@@ -414,12 +488,14 @@ def run_mace_multigpu(
             if verbose:
                 print(f"\n[MACE] Iteration {itr + 1}/{max_admm_itr}")
 
+            # Update shared buffers for the forward worker.
+            W0_shared[...] = W[0]
+            X0_shared[...] = X[0]
+
             # Submit all four agent jobs.
             forward_task_queue.put({
                 "cmd": "forward_step",
                 "itr": itr,
-                "W": W[0],
-                "X_prev": X[0],
                 "sigma_p": sigma_p,
                 "forward_num_iterations": forward_num_iterations,
                 "stop_threshold": stop_threshold,
@@ -454,7 +530,12 @@ def run_mace_multigpu(
                     raise RuntimeError("Received result from an unexpected iteration.")
 
                 agent_id = msg["agent_id"]
-                X_new[agent_id] = msg["X"]
+
+                if agent_id == 0:
+                    X_new[0] = np.copy(X0_shared)
+                else:
+                    X_new[agent_id] = msg["X"]
+
                 received += 1
 
                 if verbose:
@@ -480,7 +561,6 @@ def run_mace_multigpu(
                 print(f"[MACE] Iteration {itr + 1} done in {time.time() - itr_t0:.2f} sec.")
 
     finally:
-        # Always stop all subprocesses cleanly, even if something fails.
         forward_task_queue.put({"cmd": "stop"})
         prior_task_queues[1].put({"cmd": "stop"})
         prior_task_queues[2].put({"cmd": "stop"})
@@ -490,6 +570,11 @@ def run_mace_multigpu(
         prior_proc_1.join()
         prior_proc_2.join()
         prior_proc_3.join()
+
+        shm_W0.close()
+        shm_W0.unlink()
+        shm_X0.close()
+        shm_X0.unlink()
 
     if verbose:
         print("\n[MACE] Reconstruction complete.")
@@ -536,22 +621,14 @@ def mace4d_from_cone_beam_params_multigpu(
     )
 
 
-
-
 # -----------------------------------------------------------------------------
 # Main entry
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    print("before import mj/mjp", flush=True)
     import mbirjax as mj
     import mbirjax.preprocess as mjp
-
-    print("after import mj/mjp", flush=True)
-
-
-
     output_path = "/home/li5273/Desktop/data/output/2026/0421/4DMACE_multigpu"
     os.makedirs(output_path, exist_ok=True)
 
@@ -559,9 +636,7 @@ if __name__ == "__main__":
 
     dataset_url = "/depot/bouman/data/Lilly/4DCT/Phantom_30s_Run1_Dec2024.tgz"
     download_dir = "/home/li5273/PycharmProjects/lilly_exp/nsi/demo_data/"
-
     dataset_dir = mj.download_and_extract(dataset_url, download_dir)
-
 
     # Preprocessing parameters
     downsample_rate = [1, 1]
