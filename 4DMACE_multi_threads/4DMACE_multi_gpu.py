@@ -8,16 +8,14 @@ from utilities_4D_multi_threads import mace4d_from_cone_beam_params
 
 if __name__ == "__main__":
 
-    output_path = "./output"
+    output_path = "/home/li5273/Desktop/data/output/2026/0423/4DMACE_multi_gpu"
     os.makedirs(output_path, exist_ok=True)
 
     # Set to True if you want to use the saved init recons
-    USE_SAVED_INIT_IMAGE = False
+    USE_SAVED_INIT_IMAGE = True
 
     dataset_url = "/depot/bouman/data/Lilly/4DCT/Phantom_30s_Run1_Dec2024.tgz"
-    download_dir = "./data"
-    os.makedirs(download_dir, exist_ok=True)
-
+    download_dir = "/home/li5273/PycharmProjects/lilly_exp/nsi/demo_data/"
     dataset_dir = mj.download_and_extract(dataset_url, download_dir)
 
     # Preprocessing parameters
@@ -62,7 +60,7 @@ if __name__ == "__main__":
 
     if USE_SAVED_INIT_IMAGE:
         # Specify init recon path
-        init_image_path = ""
+        init_image_path = "/home/li5273/Desktop/data/output/2026/0423/4DMACE_multi_gpu/init/init_image.npy"
         init_image = np.load(init_image_path)
 
     else:
