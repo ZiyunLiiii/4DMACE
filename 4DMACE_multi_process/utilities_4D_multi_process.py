@@ -3,10 +3,7 @@ from __future__ import annotations
 import os
 import time
 import multiprocessing as mp
-from typing import Any, Dict, List, Tuple
-
 import numpy as np
-import mbirjax.preprocess as mjp
 
 
 # -----------------------------------------------------------------------------
@@ -187,15 +184,8 @@ def forward_agent_worker(physical_gpu_id: int, task_queue, result_queue,
 # Prior agent subprocess
 # -----------------------------------------------------------------------------
 
-def prior_agent_worker(
-    agent_id: int,
-    physical_gpu_id: int,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    permute_vector: Tuple[int, int, int, int],
-    sigma_list: np.ndarray,
-    verbose: int,
-):
+def prior_agent_worker(agent_id, physical_gpu_id, task_queue, result_queue,
+                       permute_vector, sigma_list, verbose):
     """
     Persistent prior-agent subprocess.
 
