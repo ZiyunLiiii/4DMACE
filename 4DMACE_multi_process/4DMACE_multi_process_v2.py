@@ -681,7 +681,7 @@ if __name__ == "__main__":
 
     if USE_SAVED_INIT_IMAGE:
         init_image_path = "/home/li5273/Desktop/data/output/2026/0402/4DMACE/init/init_image.npy"
-        init_image = np.load(init_image_path)
+        init_image = np.load(init_image_path)[time_range]
     else:
         init_image = None
 
