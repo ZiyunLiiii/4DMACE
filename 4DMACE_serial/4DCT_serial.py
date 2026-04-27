@@ -296,23 +296,36 @@ if __name__ == "__main__":
     else:
         init_image = None
 
+    weight_type = "transmission_root"
+    # Set this weight to balance the weights of forward and priors
+    prior_weight = 0.5
+    max_admm_itr = 10
+    # Parameter rho in the Mann iterations
+    rho = 0.5
+    forward_num_iterations = 3
+    stop_threshold = 0.02
+    sigma_p = None
+    sharpness = 1.0
+    verbose = 1
+    init_save_dir = os.path.join(output_path, "init")
+
     time0 = time.time()
     # Call MACE 4D
     recon_4d = mace4d_from_cone_beam_params(
-            sino_list,
-            cone_beam_params_list,
-            optional_params_list,
-            init_image=init_image,
-            weight_type="transmission_root",
-            prior_weight=0.5,
-            max_admm_itr=10,
-            rho=0.5,
-            forward_num_iterations=3,
-            stop_threshold=0.02,
-            sigma_p=None,
-            sharpness=1.0,
-            verbose=1,
-            init_save_dir=os.path.join(output_path, "init"),
+        sino_list,
+        cone_beam_params_list,
+        optional_params_list,
+        init_image=init_image,
+        weight_type=weight_type,
+        prior_weight=prior_weight,
+        max_admm_itr=max_admm_itr,
+        rho=rho,
+        forward_num_iterations=forward_num_iterations,
+        stop_threshold=stop_threshold,
+        sigma_p=sigma_p,
+        sharpness=sharpness,
+        verbose=verbose,
+        init_save_dir=init_save_dir,
     )
     time1 = time.time()
     run_time = (time1-time0)/60/60
