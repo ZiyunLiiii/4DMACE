@@ -30,6 +30,7 @@ import concurrent.futures
 import threading
 import time
 
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import jax
 import jax.numpy as jnp
 import mbirjax as mj
@@ -86,15 +87,17 @@ def qggmrf_hyperplane_denoise(x, sigma_list, device, sigma_noise_floor=1e-6):
     x shape: (num_hyperplanes, dim1, dim2)
     All JAX ops inside QGGMRFDenoiser run on `device` via jax.default_device().
     """
-    denoiser = get_qggmrf_denoiser(x.shape[1:])
     y = np.empty_like(x)
     with jax.default_device(device):
+        denoiser = get_qggmrf_denoiser(x.shape[1:])
+
         for i in range(x.shape[0]):
             sigma_use = sigma_list[i]
             if (not np.isfinite(sigma_use)) or (sigma_use <= sigma_noise_floor):
                 y[i] = x[i]
             else:
-                y_i, _ = denoiser.denoise(image=x[i], sigma_noise=sigma_use)
+                image_i = jax.device_put(jnp.asarray(x[i]), device)
+                y_i, _ = denoiser.denoise(image=image_i, sigma_noise=sigma_use)
                 y[i] = np.asarray(y_i)
     return y
 
@@ -111,10 +114,10 @@ def denoiser_wrapper(x, permute_vector, sigma_list, device):
 
 
 # ---------------------------------------------------------------------------
-# Multi-threads MACE
+# Multi-GPU MACE core
 # ---------------------------------------------------------------------------
 
-def run_mace_with_models_multi_threads(
+def run_mace_with_models_multigpu(
     models,
     sino_list,
     weights_list,
@@ -133,15 +136,14 @@ def run_mace_with_models_multi_threads(
     # ── GPU device discovery ───────────────────────────────────────────────
     devices = jax.devices("gpu")
     n_gpu = len(devices)
-
-    device0, device1, device2, device3 = devices[0], devices[0], devices[0], devices[0]
-
-    # Switch to the following settings if you have 4 GPUs
-    # device0, device1, device2, device3 = devices[0], devices[1], devices[2], devices[3]
-
+    if n_gpu == 0:
+        raise RuntimeError("No GPU devices found by JAX.")
+    if n_gpu < 4:
+        raise RuntimeError(f"Need at least 4 GPUs, found {n_gpu}.")
+    gpu0, gpu1, gpu2, gpu3 = devices[0], devices[1], devices[2], devices[3]
     if verbose:
         print(f"[MACE] Found {n_gpu} GPU(s): {devices}")
-        print(f"[MACE] GPU assignment: Agent0->{device0}, Agent1->{device1}, Agent2->{device2}, Agent3->{device3}")
+        print(f"[MACE] GPU assignment: Agent0->GPU0, Agent1->GPU1, Agent2->GPU2, Agent3->GPU3")
         print(f"[MACE] Start 4D reconstruction with {nt} time bins.")
 
     # ── Initialisation — serial on GPU 0, identical to original ───────────
@@ -152,8 +154,8 @@ def run_mace_with_models_multi_threads(
         init_image = np.stack([
             np.asarray(
                 models[t].recon(
-                    jax.device_put(jnp.asarray(sino_list[t]), device0),
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), device0),
+                    jax.device_put(jnp.asarray(sino_list[t]), gpu0),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
                     max_iterations=20,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
@@ -177,6 +179,12 @@ def run_mace_with_models_multi_threads(
     sigma_yzt = estimate_sigma_per_hyperplane(np.transpose(init_image, (1, 0, 2, 3)))
     sigma_xzt = estimate_sigma_per_hyperplane(np.transpose(init_image, (2, 0, 1, 3)))
     if verbose:
+        print(
+            "[MACE] Nonzero sigma counts: "
+            f"XY-t={np.count_nonzero(sigma_xyt > 1e-6)}/{sigma_xyt.size}, "
+            f"YZ-t={np.count_nonzero(sigma_yzt > 1e-6)}/{sigma_yzt.size}, "
+            f"XZ-t={np.count_nonzero(sigma_xzt > 1e-6)}/{sigma_xzt.size}"
+        )
         print("[MACE] Sigma precomputation done.")
 
     # ── ADMM state (all on CPU / NumPy) ───────────────────────────────────
@@ -190,34 +198,50 @@ def run_mace_with_models_multi_threads(
         Agent 0: cone-beam prox_map, serial over time bins, pinned to GPU 0.
         Identical logic to the original single-GPU version.
         """
-        return np.stack([
+        agent_t0 = time.time()
+        out = np.stack([
             np.asarray(
                 models[t].prox_map(
-                    prox_input=jax.device_put(jnp.asarray(W_k[t]), device0),
-                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), device0),
+                    prox_input=jax.device_put(jnp.asarray(W_k[t]), gpu0),
+                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), gpu0),
                     sigma_prox=sigma_p,
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), device0),
-                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), device0),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
+                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), gpu0),
                     max_iterations=forward_num_iterations,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
             )
             for t in range(nt)
         ])
+        if verbose:
+            print(f"[MACE]  Agent 0 ran on {gpu0} in {time.time() - agent_t0:.2f} sec.")
+        return out
 
     def run_prior_agent_1(W_k):
-        """Agent 1: qGGMRF XY-t (fixed z slabs), device 1."""
-        return denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=device1)
+        """Agent 1: qGGMRF XY-t (fixed z slabs), GPU 1."""
+        agent_t0 = time.time()
+        out = denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=gpu1)
+        if verbose:
+            print(f"[MACE]  Agent 1 ran on {gpu1} in {time.time() - agent_t0:.2f} sec.")
+        return out
 
     def run_prior_agent_2(W_k):
-        """Agent 2: qGGMRF YZ-t (fixed row slabs), device 2."""
-        return denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=device2)
+        """Agent 2: qGGMRF YZ-t (fixed row slabs), GPU 2."""
+        agent_t0 = time.time()
+        out = denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=gpu2)
+        if verbose:
+            print(f"[MACE]  Agent 2 ran on {gpu2} in {time.time() - agent_t0:.2f} sec.")
+        return out
 
     def run_prior_agent_3(W_k):
-        """Agent 3: qGGMRF XZ-t (fixed col slabs), device 3."""
-        return denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=device3)
+        """Agent 3: qGGMRF XZ-t (fixed col slabs), GPU 3."""
+        agent_t0 = time.time()
+        out = denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=gpu3)
+        if verbose:
+            print(f"[MACE]  Agent 3 ran on {gpu3} in {time.time() - agent_t0:.2f} sec.")
+        return out
 
-    # ── Main loop ─────────────────────────────────────────────────────
+    # ── Main ADMM loop ─────────────────────────────────────────────────────
     for itr in range(max_admm_itr):
         itr_t0 = time.time()
         if verbose:
@@ -227,28 +251,27 @@ def run_mace_with_models_multi_threads(
         W_snap = [np.copy(W[k]) for k in range(4)]
 
         # All 4 agents run concurrently:
-        #   Agent 0  -> Device 0 (serial over time bins)
-        #   Agent 1  -> Device 1 (qGGMRF XY-t)
-        #   Agent 2  -> Device 2 (qGGMRF YZ-t)
-        #   Agent 3  -> Device 3 (qGGMRF XZ-t)
+        #   Agent 0  -> GPU 0 (serial over time bins, same as original)
+        #   Agent 1  -> GPU 1  (qGGMRF XY-t)
+        #   Agent 2  -> GPU 2  (qGGMRF YZ-t)
+        #   Agent 3  -> GPU 3  (qGGMRF XZ-t)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            fut0 = pool.submit(run_forward_agent, W_snap[0], X[0])
-            fut1 = pool.submit(run_prior_agent_1, W_snap[1])
-            fut2 = pool.submit(run_prior_agent_2, W_snap[2])
-            fut3 = pool.submit(run_prior_agent_3, W_snap[3])
+            futures = {
+                pool.submit(run_forward_agent, W_snap[0], X[0]): (0, "forward"),
+                pool.submit(run_prior_agent_1, W_snap[1]): (1, "prior XY-t"),
+                pool.submit(run_prior_agent_2, W_snap[2]): (2, "prior YZ-t"),
+                pool.submit(run_prior_agent_3, W_snap[3]): (3, "prior XZ-t"),
+            }
 
-            X[0] = fut0.result()
-            if verbose:
-                print("[MACE]  Agent 0 (forward) done.")
-            X[1] = fut1.result()
-            if verbose:
-                print("[MACE]  Agent 1 (prior XY-t) done.")
-            X[2] = fut2.result()
-            if verbose:
-                print("[MACE]  Agent 2 (prior YZ-t) done.")
-            X[3] = fut3.result()
-            if verbose:
-                print("[MACE]  Agent 3 (prior XZ-t) done.")
+            for fut in concurrent.futures.as_completed(futures):
+                agent_id, agent_name = futures[fut]
+                done_t0 = time.time()
+                X[agent_id] = fut.result()
+                if verbose:
+                    print(
+                        f"[MACE]  Agent {agent_id} ({agent_name}) done "
+                        f"at +{done_t0 - itr_t0:.2f} sec."
+                    )
 
         if verbose:
             print("[MACE]  All agents done. Running consensus update...")
@@ -300,7 +323,7 @@ def mace4d_from_cone_beam_params(
     if verbose:
         print(f"[MACE] Built {len(models)} cone-beam models.")
 
-    recon_4d = run_mace_with_models_multi_threads(
+    recon_4d = run_mace_with_models_multigpu(
         models=models,
         sino_list=sino_list,
         weights_list=weights_list,
@@ -315,4 +338,3 @@ def mace4d_from_cone_beam_params(
         init_save_dir=init_save_dir,
     )
     return recon_4d
-
