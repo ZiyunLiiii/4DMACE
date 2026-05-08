@@ -1,11 +1,11 @@
 """
-4D MACE reconstruction with 4-GPU support.
+4D MACE reconstruction with multi(>=4)-GPU support.
 
-GPU assignment:
-  - GPU 0  ->  Agent 0: cone-beam prox_map (serial over time bins, original logic)
-  - GPU 1  ->  Agent 1: qGGMRF denoiser, XY-t hyperplanes
-  - GPU 2  ->  Agent 2: qGGMRF denoiser, YZ-t hyperplanes
-  - GPU 3  ->  Agent 3: qGGMRF denoiser, XZ-t hyperplanes
+GPU assignment is controlled by agent_device_indices:
+  - Agent 0: cone-beam prox_map (serial over time bins, original logic)
+  - Agent 1: qGGMRF denoiser, XY-t hyperplanes
+  - Agent 2: qGGMRF denoiser, YZ-t hyperplanes
+  - Agent 3: qGGMRF denoiser, XZ-t hyperplanes
 
 All 4 agents are dispatched concurrently via ThreadPoolExecutor(4).
 Each prior-agent thread uses jax.default_device() to pin all JAX ops (including
@@ -140,22 +140,30 @@ def run_mace_with_models_multigpu(
         raise RuntimeError("No GPU devices found by JAX.")
     if n_gpu < 4:
         raise RuntimeError(f"Need at least 4 GPUs, found {n_gpu}.")
-    gpu0, gpu1, gpu2, gpu3 = devices[0], devices[1], devices[2], devices[3]
+    agent_device_indices = [0, 1, 2, 3]
     if verbose:
         print(f"[MACE] Found {n_gpu} GPU(s): {devices}")
-        print(f"[MACE] GPU assignment: Agent0->GPU0, Agent1->GPU1, Agent2->GPU2, Agent3->GPU3")
+        print(
+            "[MACE] GPU assignment: "
+            + ", ".join(f"Agent{k}->GPU{idx}" for k, idx in enumerate(agent_device_indices))
+        )
         print(f"[MACE] Start 4D reconstruction with {nt} time bins.")
 
-    # ── Initialisation — serial on GPU 0, identical to original ───────────
+    # ── Initialisation — serial on Agent 0's device, identical to original ─
+    init_device_index = agent_device_indices[0]
+    init_device = devices[init_device_index]
     if init_image is None:
         if verbose:
-            print("[MACE] Computing initial MBIR recon for each time bin on GPU 0 (serial)...")
+            print(
+                f"[MACE] Computing initial MBIR recon for each time bin "
+                f"on GPU {init_device_index} (serial)..."
+            )
         t0 = time.time()
         init_image = np.stack([
             np.asarray(
                 models[t].recon(
-                    jax.device_put(jnp.asarray(sino_list[t]), gpu0),
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
+                    jax.device_put(jnp.asarray(sino_list[t]), init_device),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), init_device),
                     max_iterations=20,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
@@ -193,20 +201,20 @@ def run_mace_with_models_multigpu(
 
     # ── Agent definitions ──────────────────────────────────────────────────
 
-    def run_forward_agent(W_k, X_prev):
+    def run_forward_agent(W_k, X_prev, device_index):
         """
-        Agent 0: cone-beam prox_map, serial over time bins, pinned to GPU 0.
-        Identical logic to the original single-GPU version.
+        Agent 0: cone-beam prox_map, serial over time bins, pinned to device_index.
         """
+        device = devices[device_index]
         agent_t0 = time.time()
         out = np.stack([
             np.asarray(
                 models[t].prox_map(
-                    prox_input=jax.device_put(jnp.asarray(W_k[t]), gpu0),
-                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), gpu0),
+                    prox_input=jax.device_put(jnp.asarray(W_k[t]), device),
+                    sinogram=jax.device_put(jnp.asarray(sino_list[t]), device),
                     sigma_prox=sigma_p,
-                    weights=jax.device_put(jnp.asarray(weights_list[t]), gpu0),
-                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), gpu0),
+                    weights=jax.device_put(jnp.asarray(weights_list[t]), device),
+                    init_recon=jax.device_put(jnp.asarray(X_prev[t]), device),
                     max_iterations=forward_num_iterations,
                     stop_threshold_change_pct=stop_threshold,
                 )[0]
@@ -214,31 +222,34 @@ def run_mace_with_models_multigpu(
             for t in range(nt)
         ])
         if verbose:
-            print(f"[MACE]  Agent 0 ran on {gpu0} in {time.time() - agent_t0:.2f} sec.")
+            print(f"[MACE]  Agent 0 ran on {device} in {time.time() - agent_t0:.2f} sec.")
         return out
 
-    def run_prior_agent_1(W_k):
-        """Agent 1: qGGMRF XY-t (fixed z slabs), GPU 1."""
+    def run_prior_agent_1(W_k, device_index):
+        """Agent 1: qGGMRF XY-t (fixed z slabs)."""
+        device = devices[device_index]
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=gpu1)
+        out = denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=device)
         if verbose:
-            print(f"[MACE]  Agent 1 ran on {gpu1} in {time.time() - agent_t0:.2f} sec.")
+            print(f"[MACE]  Agent 1 ran on {device} in {time.time() - agent_t0:.2f} sec.")
         return out
 
-    def run_prior_agent_2(W_k):
-        """Agent 2: qGGMRF YZ-t (fixed row slabs), GPU 2."""
+    def run_prior_agent_2(W_k, device_index):
+        """Agent 2: qGGMRF YZ-t (fixed row slabs)."""
+        device = devices[device_index]
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=gpu2)
+        out = denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=device)
         if verbose:
-            print(f"[MACE]  Agent 2 ran on {gpu2} in {time.time() - agent_t0:.2f} sec.")
+            print(f"[MACE]  Agent 2 ran on {device} in {time.time() - agent_t0:.2f} sec.")
         return out
 
-    def run_prior_agent_3(W_k):
-        """Agent 3: qGGMRF XZ-t (fixed col slabs), GPU 3."""
+    def run_prior_agent_3(W_k, device_index):
+        """Agent 3: qGGMRF XZ-t (fixed col slabs)."""
+        device = devices[device_index]
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=gpu3)
+        out = denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=device)
         if verbose:
-            print(f"[MACE]  Agent 3 ran on {gpu3} in {time.time() - agent_t0:.2f} sec.")
+            print(f"[MACE]  Agent 3 ran on {device} in {time.time() - agent_t0:.2f} sec.")
         return out
 
     # ── Main MACE loop ─────────────────────────────────────────────────────
@@ -250,17 +261,13 @@ def run_mace_with_models_multigpu(
         # Snapshot W so all agents see a consistent state for this iteration.
         W_snap = [np.copy(W[k]) for k in range(4)]
 
-        # All 4 agents run concurrently:
-        #   Agent 0  -> GPU 0 (serial over time bins, same as original)
-        #   Agent 1  -> GPU 1  (qGGMRF XY-t)
-        #   Agent 2  -> GPU 2  (qGGMRF YZ-t)
-        #   Agent 3  -> GPU 3  (qGGMRF XZ-t)
+        # All 4 agents run concurrently on the indexed devices.
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
-                pool.submit(run_forward_agent, W_snap[0], X[0]): (0, "forward"),
-                pool.submit(run_prior_agent_1, W_snap[1]): (1, "prior XY-t"),
-                pool.submit(run_prior_agent_2, W_snap[2]): (2, "prior YZ-t"),
-                pool.submit(run_prior_agent_3, W_snap[3]): (3, "prior XZ-t"),
+                pool.submit(run_forward_agent, W_snap[0], X[0], agent_device_indices[0]): (0, "forward"),
+                pool.submit(run_prior_agent_1, W_snap[1], agent_device_indices[1]): (1, "prior XY-t"),
+                pool.submit(run_prior_agent_2, W_snap[2], agent_device_indices[2]): (2, "prior YZ-t"),
+                pool.submit(run_prior_agent_3, W_snap[3], agent_device_indices[3]): (3, "prior XZ-t"),
             }
 
             for fut in concurrent.futures.as_completed(futures):
