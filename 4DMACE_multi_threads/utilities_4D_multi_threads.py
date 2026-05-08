@@ -27,6 +27,7 @@ if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
     os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
 
 import concurrent.futures
+import csv
 import threading
 import time
 
@@ -130,6 +131,7 @@ def run_mace_with_models_multigpu(
     sigma_p=None,
     verbose=1,
     init_save_dir=None,
+    timing_log_path=None,
 ):
     nt = len(sino_list)
 
@@ -198,6 +200,25 @@ def run_mace_with_models_multigpu(
     # ── ADMM state (all on CPU / NumPy) ───────────────────────────────────
     W = [np.copy(init_image) for _ in range(4)]
     X = [np.copy(init_image) for _ in range(4)]  # warm-start for X[0]
+    timing_log = []
+
+    if timing_log_path is not None:
+        timing_log_dir = os.path.dirname(timing_log_path)
+        if timing_log_dir:
+            os.makedirs(timing_log_dir, exist_ok=True)
+        with open(timing_log_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "iteration",
+                    "agent_0_forward_sec",
+                    "agent_1_prior_xyt_sec",
+                    "agent_2_prior_yzt_sec",
+                    "agent_3_prior_xzt_sec",
+                    "iteration_total_sec",
+                ],
+            )
+            writer.writeheader()
 
     # ── Agent definitions ──────────────────────────────────────────────────
 
@@ -221,36 +242,40 @@ def run_mace_with_models_multigpu(
             )
             for t in range(nt)
         ])
+        agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 0 ran on {device} in {time.time() - agent_t0:.2f} sec.")
-        return out
+            print(f"[MACE]  Agent 0 ran on {device} in {agent_sec:.2f} sec.")
+        return out, agent_sec
 
     def run_prior_agent_1(W_k, device_index):
         """Agent 1: qGGMRF XY-t (fixed z slabs)."""
         device = devices[device_index]
         agent_t0 = time.time()
         out = denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=device)
+        agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 1 ran on {device} in {time.time() - agent_t0:.2f} sec.")
-        return out
+            print(f"[MACE]  Agent 1 ran on {device} in {agent_sec:.2f} sec.")
+        return out, agent_sec
 
     def run_prior_agent_2(W_k, device_index):
         """Agent 2: qGGMRF YZ-t (fixed row slabs)."""
         device = devices[device_index]
         agent_t0 = time.time()
         out = denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=device)
+        agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 2 ran on {device} in {time.time() - agent_t0:.2f} sec.")
-        return out
+            print(f"[MACE]  Agent 2 ran on {device} in {agent_sec:.2f} sec.")
+        return out, agent_sec
 
     def run_prior_agent_3(W_k, device_index):
         """Agent 3: qGGMRF XZ-t (fixed col slabs)."""
         device = devices[device_index]
         agent_t0 = time.time()
         out = denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=device)
+        agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 3 ran on {device} in {time.time() - agent_t0:.2f} sec.")
-        return out
+            print(f"[MACE]  Agent 3 ran on {device} in {agent_sec:.2f} sec.")
+        return out, agent_sec
 
     # ── Main MACE loop ─────────────────────────────────────────────────────
     for itr in range(max_admm_itr):
@@ -260,6 +285,7 @@ def run_mace_with_models_multigpu(
 
         # Snapshot W so all agents see a consistent state for this iteration.
         W_snap = [np.copy(W[k]) for k in range(4)]
+        agent_times = {}
 
         # All 4 agents run concurrently on the indexed devices.
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -273,7 +299,7 @@ def run_mace_with_models_multigpu(
             for fut in concurrent.futures.as_completed(futures):
                 agent_id, agent_name = futures[fut]
                 done_t0 = time.time()
-                X[agent_id] = fut.result()
+                X[agent_id], agent_times[agent_id] = fut.result()
                 if verbose:
                     print(
                         f"[MACE]  Agent {agent_id} ({agent_name}) done "
@@ -288,8 +314,33 @@ def run_mace_with_models_multigpu(
         for k in range(4):
             W[k] = W[k] + 2.0 * rho * (z - X[k])
 
+        iteration_sec = time.time() - itr_t0
+        timing_row = {
+            "iteration": itr + 1,
+            "agent_0_forward_sec": agent_times[0],
+            "agent_1_prior_xyt_sec": agent_times[1],
+            "agent_2_prior_yzt_sec": agent_times[2],
+            "agent_3_prior_xzt_sec": agent_times[3],
+            "iteration_total_sec": iteration_sec,
+        }
+        timing_log.append(timing_row)
+
+        if timing_log_path is not None:
+            with open(timing_log_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=timing_row.keys())
+                writer.writerow(timing_row)
+
         if verbose:
-            print(f"[MACE] Iteration {itr + 1} done in {time.time() - itr_t0:.2f} sec.")
+            print(
+                "[MACE] Timing summary: "
+                f"itr={itr + 1}, "
+                f"agent0={agent_times[0]:.2f}s, "
+                f"agent1={agent_times[1]:.2f}s, "
+                f"agent2={agent_times[2]:.2f}s, "
+                f"agent3={agent_times[3]:.2f}s, "
+                f"total={iteration_sec:.2f}s"
+            )
+            print(f"[MACE] Iteration {itr + 1} done in {iteration_sec:.2f} sec.")
 
     if verbose:
         print("\n[MACE] Reconstruction complete.")
@@ -311,6 +362,7 @@ def mace4d_from_cone_beam_params(
     sharpness=1.0,
     verbose=1,
     init_save_dir=None,
+    timing_log_path=None,
 ):
     if verbose:
         print("[MACE] Building weights and per-bin cone-beam models...")
@@ -343,5 +395,6 @@ def mace4d_from_cone_beam_params(
         sigma_p=sigma_p,
         verbose=verbose,
         init_save_dir=init_save_dir,
+        timing_log_path=timing_log_path,
     )
     return recon_4d

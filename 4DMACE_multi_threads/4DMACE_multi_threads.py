@@ -78,6 +78,7 @@ if __name__ == "__main__":
     sharpness = 1.0
     verbose = 1
     init_save_dir = os.path.join(output_path, "init")
+    timing_log_path = os.path.join(output_path, "timing_log.csv")
 
     time0 = time.time()
 
@@ -96,6 +97,7 @@ if __name__ == "__main__":
         sharpness=sharpness,
         verbose=verbose,
         init_save_dir=init_save_dir,
+        timing_log_path=timing_log_path,
     )
 
     time1 = time.time()
