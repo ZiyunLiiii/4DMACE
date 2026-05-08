@@ -241,7 +241,7 @@ def run_mace_with_models_multigpu(
             print(f"[MACE]  Agent 3 ran on {gpu3} in {time.time() - agent_t0:.2f} sec.")
         return out
 
-    # ── Main ADMM loop ─────────────────────────────────────────────────────
+    # ── Main MACE loop ─────────────────────────────────────────────────────
     for itr in range(max_admm_itr):
         itr_t0 = time.time()
         if verbose:
@@ -276,7 +276,7 @@ def run_mace_with_models_multigpu(
         if verbose:
             print("[MACE]  All agents done. Running consensus update...")
 
-        # Consensus / ADMM update (CPU)
+        # MACE consensus update (CPU)
         z = sum(beta[k] * (2.0 * X[k] - W[k]) for k in range(4))
         for k in range(4):
             W[k] = W[k] + 2.0 * rho * (z - X[k])
