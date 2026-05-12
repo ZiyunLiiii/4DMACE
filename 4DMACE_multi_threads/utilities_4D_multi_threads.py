@@ -3,21 +3,23 @@
 
 GPU assignment is controlled by agent_device_indices:
   - Agent 0: cone-beam prox_map (serial over time bins, original logic)
-  - Agent 1: qGGMRF denoiser, XY-t hyperplanes
-  - Agent 2: qGGMRF denoiser, YZ-t hyperplanes
-  - Agent 3: qGGMRF denoiser, XZ-t hyperplanes
+  - Agent 1: ViDNet denoiser, fixed-z XY-t hyperplanes
+  - Agent 2: ViDNet denoiser, fixed-x YZ-t hyperplanes
+  - Agent 3: ViDNet denoiser, fixed-y XZ-t hyperplanes
 
 All 4 agents are dispatched concurrently via ThreadPoolExecutor(4).
-Each prior-agent thread uses jax.default_device() to pin all JAX ops (including
-QGGMRFDenoiser) to its assigned GPU.
+Each prior-agent thread runs ViDNet with PyTorch on its assigned CUDA device.
 init_image (large) lives on CPU as a NumPy array throughout.
-Per-thread denoiser caching avoids cross-thread JAX state sharing.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+
+# Let JAX preallocate a smaller GPU-memory pool so PyTorch ViDNet agents still have room.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.35"
 
 # Ensure JAX does not inherit incompatible system CUDA/cuDNN from LD_LIBRARY_PATH.
 if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
@@ -28,31 +30,18 @@ if "LD_LIBRARY_PATH" in os.environ and not os.environ.get("_JAX_CLEAN_REEXEC"):
 
 import concurrent.futures
 import csv
-import threading
 import time
 
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import jax
 import jax.numpy as jnp
 import mbirjax as mj
 import numpy as np
+import torch
 
-# ---------------------------------------------------------------------------
-# Thread-local denoiser cache
-# ---------------------------------------------------------------------------
-
-_THREAD_LOCAL = threading.local()
-
-
-def get_qggmrf_denoiser(shape):
-    """Return a per-thread cached QGGMRFDenoiser to avoid cross-thread state sharing."""
-    cache = getattr(_THREAD_LOCAL, "denoiser_cache", None)
-    if cache is None:
-        cache = {}
-        _THREAD_LOCAL.denoiser_cache = cache
-    if shape not in cache:
-        cache[shape] = mj.QGGMRFDenoiser(shape)
-    return cache[shape]
+STRIVER_ROOT = "/home/li5273/PycharmProjects/STRIVER-deep"
+VIDNET_MODEL_PATH = f"{STRIVER_ROOT}/models/vidnet/vidnet.pth"
+VIDNET_SIGMAS = (0.018, 0.018, 0.008)
+VIDNET_BATCH_SIZE = 8
 
 
 # ---------------------------------------------------------------------------
@@ -67,49 +56,139 @@ def normalize_prior_weights(prior_weight):
     return [1.0 - w, w / 3.0, w / 3.0, w / 3.0]
 
 
-def estimate_sigma_per_hyperplane(x, sigma_noise_floor=1e-6):
-    """
-    Estimate one sigma value per hyperplane.
-    x shape: (num_hyperplanes, dim1, dim2)
-    """
-    denoiser = get_qggmrf_denoiser(x.shape[1:])
-    sigma_list = np.empty(x.shape[0], dtype=np.float32)
-    for i in range(x.shape[0]):
-        sigma_use = denoiser.estimate_image_noise_std(x[i][:, ::4, ::4])
-        if (not np.isfinite(sigma_use)) or (sigma_use <= sigma_noise_floor):
-            sigma_use = 0.0
-        sigma_list[i] = sigma_use
-    return sigma_list
+def import_vidnet_wrapper(striver_root=STRIVER_ROOT):
+    if striver_root not in sys.path:
+        sys.path.insert(0, striver_root)
+
+    from models.vidnet.wrapper import VideoDenoiserViDNet
+
+    return VideoDenoiserViDNet
 
 
-def qggmrf_hyperplane_denoise(x, sigma_list, device, sigma_noise_floor=1e-6):
+def normalize_hyperplane_batch(video_bthw):
     """
-    Denoise a stack of hyperplanes on the given JAX device.
-    x shape: (num_hyperplanes, dim1, dim2)
-    All JAX ops inside QGGMRFDenoiser run on `device` via jax.default_device().
-    """
-    y = np.empty_like(x)
-    with jax.default_device(device):
-        denoiser = get_qggmrf_denoiser(x.shape[1:])
+    Normalize each hyperplane video independently to [0, 1].
 
-        for i in range(x.shape[0]):
-            sigma_use = sigma_list[i]
-            if (not np.isfinite(sigma_use)) or (sigma_use <= sigma_noise_floor):
-                y[i] = x[i]
+    video_bthw shape: (B, T, H, W)
+    """
+    video_bthw = video_bthw.astype(np.float32, copy=False)
+    mins = video_bthw.min(axis=(1, 2, 3), keepdims=True)
+    maxs = video_bthw.max(axis=(1, 2, 3), keepdims=True)
+    ranges = maxs - mins
+
+    video_norm = np.zeros_like(video_bthw, dtype=np.float32)
+    np.divide(
+        video_bthw - mins,
+        ranges,
+        out=video_norm,
+        where=ranges > 0,
+    )
+    video_norm = np.clip(video_norm, 0.0, 1.0).astype(np.float32, copy=False)
+    return video_norm, mins.astype(np.float32), maxs.astype(np.float32)
+
+
+def denormalize_hyperplane_batch(video_norm_bthw, mins, maxs):
+    ranges = maxs - mins
+    return (video_norm_bthw * ranges + mins).astype(np.float32, copy=False)
+
+
+def run_vidnet_inference(denoiser, video_norm_bthw, sigma_norm, torch_device):
+    """
+    Run ViDNet on a normalized batch.
+
+    Preferred tensor shape is (B, T, C, H, W). If the STRIVER wrapper only
+    supports one video at a time, fall back to (T, C, H, W) per hyperplane.
+    """
+    vid = torch.from_numpy(video_norm_bthw[:, :, None, :, :]).float().to(torch_device)
+
+    with torch.no_grad():
+        try:
+            den = denoiser.inference(vid, sig=sigma_norm)
+            den = den.detach().cpu().numpy()
+            if den.ndim == 5:
+                den = den[:, :, 0, :, :]
+            elif den.ndim == 4:
+                den = den[:, 0, :, :][None, ...]
             else:
-                image_i = jax.device_put(jnp.asarray(x[i]), device)
-                y_i, _ = denoiser.denoise(image=image_i, sigma_noise=sigma_use)
-                y[i] = np.asarray(y_i)
-    return y
+                raise ValueError(f"Unexpected ViDNet output shape: {den.shape}")
+        except (RuntimeError, ValueError, IndexError):
+            del vid
+            torch.cuda.empty_cache()
+            den_list = []
+            for video_norm_thw in video_norm_bthw:
+                vid_one = torch.from_numpy(video_norm_thw[:, None, :, :]).float().to(torch_device)
+                den_one = denoiser.inference(vid_one, sig=sigma_norm)
+                den_one = den_one.detach().cpu().numpy()[:, 0, :, :]
+                den_list.append(den_one)
+            den = np.stack(den_list, axis=0)
+
+    return np.clip(den, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-def denoiser_wrapper(x, permute_vector, sigma_list, device):
+def vidnet_hyperplane_denoise(
+    x_perm,
+    sigma_norm,
+    torch_device,
+    model_path=VIDNET_MODEL_PATH,
+    striver_root=STRIVER_ROOT,
+    batch_size=VIDNET_BATCH_SIZE,
+    verbose=1,
+):
     """
-    Permute 4D volume -> denoise hyperplane stack on device -> permute back.
+    Denoise a hyperplane stack with ViDNet.
+
+    x_perm shape: (num_hyperplanes, T, H, W)
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("PyTorch CUDA is not available; ViDNet prior agents require CUDA.")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"ViDNet model not found: {model_path}")
+
+    torch.cuda.set_device(torch_device)
+    VideoDenoiserViDNet = import_vidnet_wrapper(striver_root)
+    denoiser = VideoDenoiserViDNet(model_path=model_path, device=torch_device)
+
+    y_perm = np.empty_like(x_perm, dtype=np.float32)
+    for start in range(0, x_perm.shape[0], batch_size):
+        end = min(start + batch_size, x_perm.shape[0])
+        batch = x_perm[start:end]
+        batch_norm, mins, maxs = normalize_hyperplane_batch(batch)
+        den_norm = run_vidnet_inference(denoiser, batch_norm, sigma_norm, torch_device)
+        y_perm[start:end] = denormalize_hyperplane_batch(den_norm, mins, maxs)
+
+        if verbose:
+            print(
+                f"[MACE]    ViDNet {torch_device} batch {start}:{end}/"
+                f"{x_perm.shape[0]}, sigma={sigma_norm:.6f}"
+            )
+
+    return y_perm
+
+
+def denoiser_wrapper(
+    x,
+    permute_vector,
+    sigma_norm,
+    torch_device,
+    model_path=VIDNET_MODEL_PATH,
+    striver_root=STRIVER_ROOT,
+    batch_size=VIDNET_BATCH_SIZE,
+    verbose=1,
+):
+    """
+    Permute 4D volume -> denoise hyperplane stack -> permute back.
     x shape: (nt, nx, ny, nz)
     """
-    x_perm = np.transpose(x, permute_vector)
-    y_perm = qggmrf_hyperplane_denoise(x_perm, sigma_list=sigma_list, device=device)
+    x_perm = np.ascontiguousarray(np.transpose(x, permute_vector), dtype=np.float32)
+    y_perm = vidnet_hyperplane_denoise(
+        x_perm,
+        sigma_norm=sigma_norm,
+        torch_device=torch_device,
+        model_path=model_path,
+        striver_root=striver_root,
+        batch_size=batch_size,
+        verbose=verbose,
+    )
     inv_perm = np.argsort(permute_vector)
     return np.transpose(y_perm, inv_perm)
 
@@ -132,6 +211,10 @@ def run_mace_with_models_multigpu(
     verbose=1,
     init_save_dir=None,
     timing_log_path=None,
+    vidnet_model_path=VIDNET_MODEL_PATH,
+    striver_root=STRIVER_ROOT,
+    vidnet_sigmas=VIDNET_SIGMAS,
+    vidnet_batch_size=VIDNET_BATCH_SIZE,
 ):
     nt = len(sino_list)
 
@@ -150,6 +233,8 @@ def run_mace_with_models_multigpu(
             + ", ".join(f"Agent{k}->GPU{idx}" for k, idx in enumerate(agent_device_indices))
         )
         print(f"[MACE] Start 4D reconstruction with {nt} time bins.")
+        print(f"[MACE] ViDNet sigmas: {tuple(vidnet_sigmas)}")
+        print(f"[MACE] ViDNet model: {vidnet_model_path}")
 
     # ── Initialisation — serial on Agent 0's device, identical to original ─
     init_device_index = agent_device_indices[0]
@@ -181,21 +266,6 @@ def run_mace_with_models_multigpu(
         init_image = np.asarray(init_image)
         if verbose:
             print("[MACE] Using provided init_image.")
-
-    # ── Pre-compute sigma lists (CPU, one-time) ────────────────────────────
-    if verbose:
-        print("[MACE] Precomputing sigma lists...")
-    sigma_xyt = estimate_sigma_per_hyperplane(np.transpose(init_image, (3, 0, 1, 2)))
-    sigma_yzt = estimate_sigma_per_hyperplane(np.transpose(init_image, (1, 0, 2, 3)))
-    sigma_xzt = estimate_sigma_per_hyperplane(np.transpose(init_image, (2, 0, 1, 3)))
-    if verbose:
-        print(
-            "[MACE] Nonzero sigma counts: "
-            f"XY-t={np.count_nonzero(sigma_xyt > 1e-6)}/{sigma_xyt.size}, "
-            f"YZ-t={np.count_nonzero(sigma_yzt > 1e-6)}/{sigma_yzt.size}, "
-            f"XZ-t={np.count_nonzero(sigma_xzt > 1e-6)}/{sigma_xzt.size}"
-        )
-        print("[MACE] Sigma precomputation done.")
 
     # ── ADMM state (all on CPU / NumPy) ───────────────────────────────────
     W = [np.copy(init_image) for _ in range(4)]
@@ -248,33 +318,60 @@ def run_mace_with_models_multigpu(
         return out, agent_sec
 
     def run_prior_agent_1(W_k, device_index):
-        """Agent 1: qGGMRF XY-t (fixed z slabs)."""
-        device = devices[device_index]
+        """Agent 1: ViDNet XY-t, fixed z slabs. Batch shape (z, t, x, y)."""
+        torch_device = f"cuda:{device_index}"
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(3, 0, 1, 2), sigma_list=sigma_xyt, device=device)
+        out = denoiser_wrapper(
+            W_k,
+            permute_vector=(3, 0, 1, 2),
+            sigma_norm=vidnet_sigmas[0],
+            torch_device=torch_device,
+            model_path=vidnet_model_path,
+            striver_root=striver_root,
+            batch_size=vidnet_batch_size,
+            verbose=verbose,
+        )
         agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 1 ran on {device} in {agent_sec:.2f} sec.")
+            print(f"[MACE]  Agent 1 ran ViDNet on {torch_device} in {agent_sec:.2f} sec.")
         return out, agent_sec
 
     def run_prior_agent_2(W_k, device_index):
-        """Agent 2: qGGMRF YZ-t (fixed row slabs)."""
-        device = devices[device_index]
+        """Agent 2: ViDNet YZ-t, fixed x slabs. Batch shape (x, t, y, z)."""
+        torch_device = f"cuda:{device_index}"
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(1, 0, 2, 3), sigma_list=sigma_yzt, device=device)
+        out = denoiser_wrapper(
+            W_k,
+            permute_vector=(1, 0, 2, 3),
+            sigma_norm=vidnet_sigmas[1],
+            torch_device=torch_device,
+            model_path=vidnet_model_path,
+            striver_root=striver_root,
+            batch_size=vidnet_batch_size,
+            verbose=verbose,
+        )
         agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 2 ran on {device} in {agent_sec:.2f} sec.")
+            print(f"[MACE]  Agent 2 ran ViDNet on {torch_device} in {agent_sec:.2f} sec.")
         return out, agent_sec
 
     def run_prior_agent_3(W_k, device_index):
-        """Agent 3: qGGMRF XZ-t (fixed col slabs)."""
-        device = devices[device_index]
+        """Agent 3: ViDNet XZ-t, fixed y slabs. Batch shape (y, t, x, z)."""
+        torch_device = f"cuda:{device_index}"
         agent_t0 = time.time()
-        out = denoiser_wrapper(W_k, permute_vector=(2, 0, 1, 3), sigma_list=sigma_xzt, device=device)
+        out = denoiser_wrapper(
+            W_k,
+            permute_vector=(2, 0, 1, 3),
+            sigma_norm=vidnet_sigmas[2],
+            torch_device=torch_device,
+            model_path=vidnet_model_path,
+            striver_root=striver_root,
+            batch_size=vidnet_batch_size,
+            verbose=verbose,
+        )
         agent_sec = time.time() - agent_t0
         if verbose:
-            print(f"[MACE]  Agent 3 ran on {device} in {agent_sec:.2f} sec.")
+            print(f"[MACE]  Agent 3 ran ViDNet on {torch_device} in {agent_sec:.2f} sec.")
         return out, agent_sec
 
     # ── Main MACE loop ─────────────────────────────────────────────────────
@@ -363,6 +460,10 @@ def mace4d_from_cone_beam_params(
     verbose=1,
     init_save_dir=None,
     timing_log_path=None,
+    vidnet_model_path=VIDNET_MODEL_PATH,
+    striver_root=STRIVER_ROOT,
+    vidnet_sigmas=VIDNET_SIGMAS,
+    vidnet_batch_size=VIDNET_BATCH_SIZE,
 ):
     if verbose:
         print("[MACE] Building weights and per-bin cone-beam models...")
@@ -396,5 +497,9 @@ def mace4d_from_cone_beam_params(
         verbose=verbose,
         init_save_dir=init_save_dir,
         timing_log_path=timing_log_path,
+        vidnet_model_path=vidnet_model_path,
+        striver_root=striver_root,
+        vidnet_sigmas=vidnet_sigmas,
+        vidnet_batch_size=vidnet_batch_size,
     )
     return recon_4d

@@ -1,4 +1,9 @@
 import os
+
+# Set before importing JAX/MBIRJAX so JAX keeps a smaller preallocated pool.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.35"
+
 import mbirjax as mj
 import mbirjax.preprocess as mjp
 import numpy as np
@@ -79,6 +84,10 @@ if __name__ == "__main__":
     verbose = 1
     init_save_dir = os.path.join(output_path, "init")
     timing_log_path = os.path.join(output_path, "timing_log.csv")
+    striver_root = "/home/li5273/PycharmProjects/STRIVER-deep"
+    vidnet_model_path = f"{striver_root}/models/vidnet/vidnet.pth"
+    vidnet_sigmas = (0.018, 0.018, 0.008)
+    vidnet_batch_size = 8
 
     time0 = time.time()
 
@@ -98,6 +107,10 @@ if __name__ == "__main__":
         verbose=verbose,
         init_save_dir=init_save_dir,
         timing_log_path=timing_log_path,
+        striver_root=striver_root,
+        vidnet_model_path=vidnet_model_path,
+        vidnet_sigmas=vidnet_sigmas,
+        vidnet_batch_size=vidnet_batch_size,
     )
 
     time1 = time.time()
