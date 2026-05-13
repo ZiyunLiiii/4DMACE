@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
     weight_type = "transmission_root"
     prior_weight = 0.5
-    max_admm_itr = 10
+    max_mace_itr = 10
     rho = 0.5
     forward_num_iterations = 3
     stop_threshold = 0.02
@@ -98,7 +98,7 @@ if __name__ == "__main__":
         init_image=init_image,
         weight_type=weight_type,
         prior_weight=prior_weight,
-        max_admm_itr=max_admm_itr,
+        max_mace_itr=max_mace_itr,
         rho=rho,
         forward_num_iterations=forward_num_iterations,
         stop_threshold=stop_threshold,
