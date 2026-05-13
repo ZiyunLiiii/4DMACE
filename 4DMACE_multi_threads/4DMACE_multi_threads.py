@@ -87,7 +87,7 @@ if __name__ == "__main__":
     striver_root = "/home/li5273/PycharmProjects/STRIVER-deep"
     vidnet_model_path = f"{striver_root}/models/vidnet/vidnet.pth"
     vidnet_sigmas = (0.018, 0.018, 0.008)
-    vidnet_batch_size = 8
+    vidnet_batch_size = [64, 64, 64]
 
     time0 = time.time()
 

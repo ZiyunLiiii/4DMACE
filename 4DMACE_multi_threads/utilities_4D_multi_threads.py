@@ -328,7 +328,7 @@ def run_mace_with_models_multigpu(
             torch_device=torch_device,
             model_path=vidnet_model_path,
             striver_root=striver_root,
-            batch_size=vidnet_batch_size,
+            batch_size=vidnet_batch_size[0],
             verbose=verbose,
         )
         agent_sec = time.time() - agent_t0
@@ -347,7 +347,7 @@ def run_mace_with_models_multigpu(
             torch_device=torch_device,
             model_path=vidnet_model_path,
             striver_root=striver_root,
-            batch_size=vidnet_batch_size,
+            batch_size=vidnet_batch_size[1],
             verbose=verbose,
         )
         agent_sec = time.time() - agent_t0
@@ -366,7 +366,7 @@ def run_mace_with_models_multigpu(
             torch_device=torch_device,
             model_path=vidnet_model_path,
             striver_root=striver_root,
-            batch_size=vidnet_batch_size,
+            batch_size=vidnet_batch_size[2],
             verbose=verbose,
         )
         agent_sec = time.time() - agent_t0
